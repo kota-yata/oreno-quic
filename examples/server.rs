@@ -1,12 +1,18 @@
 use oreno_quic::connection::{Connection, ConnectionManager, ConnectionState};
 use oreno_quic::frame::Frame;
 use oreno_quic::packet::PacketHeader;
+use oreno_quic::tls::TlsConfig;
 use bytes::Bytes;
 use tokio::net::UdpSocket;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Starting QUIC server...");
+    println!("Starting QUIC server with TLS 1.3...");
+    
+    // Setup TLS configuration with self-signed certificates
+    let tls_config = Arc::new(TlsConfig::new()?);
+    println!("Generated self-signed certificate for localhost");
     
     let socket = UdpSocket::bind("127.0.0.1:4433").await?;
     let local_addr = socket.local_addr()?;
@@ -31,13 +37,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     PacketHeader::Short(h) => &h.dest_conn_id,
                 };
                 
-                let mut connection = connection_manager
-                    .get_connection(&conn_id.data)
-                    .map(|c| c.clone())
-                    .unwrap_or_else(|| {
-                        println!("[{}] Creating new connection", peer_addr);
-                        Connection::new_server(peer_addr, conn_id.clone())
-                    });
+                let connection_exists = connection_manager.get_connection(&conn_id.data).is_some();
+                
+                if !connection_exists {
+                    println!("[{}] Creating new connection with TLS", peer_addr);
+                    let mut new_connection = Connection::new_server(peer_addr, conn_id.clone());
+                    
+                    // Setup TLS for the new connection
+                    if let Err(e) = new_connection.setup_tls(tls_config.clone()) {
+                        println!("[{}] Failed to setup TLS: {}", peer_addr, e);
+                        continue;
+                    }
+                    
+                    connection_manager.add_connection(conn_id.data.clone(), new_connection);
+                }
+                
+                let connection = connection_manager.get_connection(&conn_id.data).unwrap();
                 
                 while !packet_data.is_empty() {
                     match Frame::decode(&mut packet_data) {
@@ -62,6 +77,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 Frame::Padding { length } => {
                                     println!("[{}] Received {} bytes of padding", peer_addr, length);
                                 }
+                                Frame::Crypto { offset, ref data } => {
+                                    println!("[{}] Received CRYPTO frame: offset={}, data_len={}", peer_addr, offset, data.len());
+                                    
+                                    // Process TLS handshake data
+                                    match connection.process_crypto_frame(&frame) {
+                                        Ok(Some(response_packet)) => {
+                                            println!("[{}] Sending TLS handshake response", peer_addr);
+                                            socket.send_to(&response_packet, peer_addr).await?;
+                                        }
+                                        Ok(None) => {
+                                            if connection.is_tls_handshake_complete() {
+                                                println!("[{}] TLS handshake completed successfully!", peer_addr);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            println!("[{}] TLS handshake error: {}", peer_addr, e);
+                                        }
+                                    }
+                                }
                             }
                         }
                         Err(e) => {
@@ -71,9 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 
-                if !connection.is_closed() {
-                    connection_manager.add_connection(conn_id.data.clone(), connection);
-                }
+                // Connection is already in the manager, no need to re-add
             }
             Err(e) => {
                 println!("[{}] Packet decode error: {}", peer_addr, e);

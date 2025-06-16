@@ -1,6 +1,8 @@
 mod packet;
 mod connection;
 mod frame;
+mod crypto;
+mod tls;
 
 use crate::connection::{Connection, ConnectionManager, ConnectionState};
 use crate::frame::Frame;
@@ -34,13 +36,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     PacketHeader::Short(h) => &h.dest_conn_id,
                 };
                 
-                let mut connection = connection_manager
-                    .get_connection(&conn_id.data)
-                    .map(|c| c.clone())
-                    .unwrap_or_else(|| {
-                        println!("Creating new connection for peer {}", peer_addr);
-                        Connection::new_server(peer_addr, conn_id.clone())
-                    });
+                let connection_exists = connection_manager.get_connection(&conn_id.data).is_some();
+                
+                if !connection_exists {
+                    println!("Creating new connection for peer {}", peer_addr);
+                    let new_connection = Connection::new_server(peer_addr, conn_id.clone());
+                    connection_manager.add_connection(conn_id.data.clone(), new_connection);
+                }
+                
+                let connection = connection_manager.get_connection(&conn_id.data).unwrap();
                 
                 while !packet_data.is_empty() {
                     match Frame::decode(&mut packet_data) {
@@ -62,6 +66,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 Frame::Padding { .. } => {
                                     // Just padding, ignore
                                 }
+                                Frame::Crypto { .. } => {
+                                    // TLS handshake data, ignore for now
+                                    println!("Received CRYPTO frame (TLS handshake)");
+                                }
                             }
                         }
                         Err(e) => {
@@ -69,10 +77,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             break;
                         }
                     }
-                }
-                
-                if !connection.is_closed() {
-                    connection_manager.add_connection(conn_id.data.clone(), connection);
                 }
             }
             Err(e) => {

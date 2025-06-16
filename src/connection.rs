@@ -1,8 +1,11 @@
 use crate::packet::{ConnectionId, PacketHeader, LongHeader, PacketType};
 use crate::frame::Frame;
+use crate::tls::{TlsConfig, QuicClientTls, QuicServerTls};
+use crate::crypto::QuicCrypto;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use bytes::BytesMut;
+use std::sync::Arc;
+use bytes::{BytesMut, Bytes};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -13,7 +16,7 @@ pub enum ConnectionState {
     Closed,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Connection {
     pub local_conn_id: ConnectionId,
     pub remote_conn_id: Option<ConnectionId>,
@@ -21,28 +24,55 @@ pub struct Connection {
     pub remote_addr: SocketAddr,
     pub packet_number: u64,
     pub version: u32,
+    pub is_client: bool,
+    pub crypto: QuicCrypto,
+    pub tls_config: Option<Arc<TlsConfig>>,
+    pub client_tls: Option<QuicClientTls>,
+    pub server_tls: Option<QuicServerTls>,
 }
 
 impl Connection {
     pub fn new_client(remote_addr: SocketAddr) -> Self {
+        let mut crypto = QuicCrypto::new();
+        let local_conn_id = ConnectionId::random(8);
+        
+        // Setup initial encryption keys
+        let _ = crypto.setup_initial_keys(&local_conn_id.data, true);
+        
         Self {
-            local_conn_id: ConnectionId::random(8),
+            local_conn_id,
             remote_conn_id: None,
             state: ConnectionState::Initial,
             remote_addr,
             packet_number: 0,
             version: 1,
+            is_client: true,
+            crypto,
+            tls_config: None,
+            client_tls: None,
+            server_tls: None,
         }
     }
     
     pub fn new_server(remote_addr: SocketAddr, remote_conn_id: ConnectionId) -> Self {
+        let mut crypto = QuicCrypto::new();
+        let local_conn_id = ConnectionId::random(8);
+        
+        // Setup initial encryption keys
+        let _ = crypto.setup_initial_keys(&remote_conn_id.data, false);
+        
         Self {
-            local_conn_id: ConnectionId::random(8),
+            local_conn_id,
             remote_conn_id: Some(remote_conn_id),
             state: ConnectionState::Initial,
             remote_addr,
             packet_number: 0,
             version: 1,
+            is_client: false,
+            crypto,
+            tls_config: None,
+            client_tls: None,
+            server_tls: None,
         }
     }
     
@@ -95,6 +125,118 @@ impl Connection {
     
     pub fn is_closed(&self) -> bool {
         matches!(self.state, ConnectionState::Closed)
+    }
+    
+    pub fn setup_tls(&mut self, tls_config: Arc<TlsConfig>) -> Result<(), ConnectionError> {
+        self.tls_config = Some(tls_config.clone());
+        
+        if self.is_client {
+            let client_tls = QuicClientTls::new(tls_config.client_config.clone(), "localhost")
+                .map_err(|_| ConnectionError::TlsSetupFailed)?;
+            self.client_tls = Some(client_tls);
+        } else {
+            let server_tls = QuicServerTls::new(tls_config.server_config.clone())
+                .map_err(|_| ConnectionError::TlsSetupFailed)?;
+            self.server_tls = Some(server_tls);
+        }
+        
+        Ok(())
+    }
+    
+    pub fn start_tls_handshake(&mut self) -> Result<Vec<u8>, ConnectionError> {
+        if self.is_client {
+            if let Some(ref mut client_tls) = self.client_tls {
+                let handshake_data = client_tls.get_handshake_data()
+                    .map_err(|_| ConnectionError::TlsHandshakeFailed)?;
+                
+                if !handshake_data.is_empty() {
+                    let crypto_frame = Frame::Crypto {
+                        offset: 0,
+                        data: Bytes::from(handshake_data),
+                    };
+                    
+                    return self.create_initial_packet(vec![crypto_frame]);
+                }
+            }
+        } else {
+            if let Some(ref mut server_tls) = self.server_tls {
+                let handshake_data = server_tls.get_handshake_data()
+                    .map_err(|_| ConnectionError::TlsHandshakeFailed)?;
+                
+                if !handshake_data.is_empty() {
+                    let crypto_frame = Frame::Crypto {
+                        offset: 0,
+                        data: Bytes::from(handshake_data),
+                    };
+                    
+                    return self.create_initial_packet(vec![crypto_frame]);
+                }
+            }
+        }
+        
+        Err(ConnectionError::TlsNotSetup)
+    }
+    
+    pub fn process_crypto_frame(&mut self, crypto_frame: &Frame) -> Result<Option<Vec<u8>>, ConnectionError> {
+        if let Frame::Crypto { offset: _, data } = crypto_frame {
+            if self.is_client {
+                if let Some(ref mut client_tls) = self.client_tls {
+                    client_tls.process_handshake_data(data)
+                        .map_err(|_| ConnectionError::TlsHandshakeFailed)?;
+                    
+                    if client_tls.is_handshake_complete() {
+                        self.handle_state_transition(ConnectionState::Established);
+                        return Ok(None);
+                    }
+                    
+                    let response_data = client_tls.get_handshake_data()
+                        .map_err(|_| ConnectionError::TlsHandshakeFailed)?;
+                    
+                    if !response_data.is_empty() {
+                        let crypto_frame = Frame::Crypto {
+                            offset: 0,
+                            data: Bytes::from(response_data),
+                        };
+                        
+                        let packet = self.create_handshake_packet(vec![crypto_frame])?;
+                        return Ok(Some(packet));
+                    }
+                }
+            } else {
+                if let Some(ref mut server_tls) = self.server_tls {
+                    server_tls.process_handshake_data(data)
+                        .map_err(|_| ConnectionError::TlsHandshakeFailed)?;
+                    
+                    if server_tls.is_handshake_complete() {
+                        self.handle_state_transition(ConnectionState::Established);
+                        return Ok(None);
+                    }
+                    
+                    let response_data = server_tls.get_handshake_data()
+                        .map_err(|_| ConnectionError::TlsHandshakeFailed)?;
+                    
+                    if !response_data.is_empty() {
+                        let crypto_frame = Frame::Crypto {
+                            offset: 0,
+                            data: Bytes::from(response_data),
+                        };
+                        
+                        let packet = self.create_handshake_packet(vec![crypto_frame])?;
+                        return Ok(Some(packet));
+                    }
+                }
+            }
+        }
+        
+        Ok(None)
+    }
+    
+    pub fn is_tls_handshake_complete(&self) -> bool {
+        if self.is_client {
+            self.client_tls.as_ref().map_or(false, |tls| tls.is_handshake_complete())
+        } else {
+            self.server_tls.as_ref().map_or(false, |tls| tls.is_handshake_complete())
+        }
     }
     
     pub fn close(&mut self, reason: String) -> Result<Vec<u8>, ConnectionError> {
@@ -153,6 +295,9 @@ pub enum ConnectionError {
     PacketEncoding,
     FrameEncoding,
     InvalidState,
+    TlsSetupFailed,
+    TlsHandshakeFailed,
+    TlsNotSetup,
 }
 
 impl std::fmt::Display for ConnectionError {
@@ -161,6 +306,9 @@ impl std::fmt::Display for ConnectionError {
             ConnectionError::PacketEncoding => write!(f, "Packet encoding error"),
             ConnectionError::FrameEncoding => write!(f, "Frame encoding error"),
             ConnectionError::InvalidState => write!(f, "Invalid connection state"),
+            ConnectionError::TlsSetupFailed => write!(f, "TLS setup failed"),
+            ConnectionError::TlsHandshakeFailed => write!(f, "TLS handshake failed"),
+            ConnectionError::TlsNotSetup => write!(f, "TLS not setup"),
         }
     }
 }
