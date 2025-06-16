@@ -5,6 +5,7 @@ use std::fmt;
 pub enum FrameType {
     Padding = 0x00,
     Ping = 0x01,
+    Crypto = 0x06,
     ConnectionClose = 0x1c,
 }
 
@@ -12,6 +13,7 @@ pub enum FrameType {
 pub enum Frame {
     Padding { length: usize },
     Ping,
+    Crypto { offset: u64, data: Bytes },
     ConnectionClose { error_code: u64, reason: String },
 }
 
@@ -25,6 +27,12 @@ impl Frame {
             }
             Frame::Ping => {
                 buf.put_u8(FrameType::Ping as u8);
+            }
+            Frame::Crypto { offset, data } => {
+                buf.put_u8(FrameType::Crypto as u8);
+                encode_varint(buf, *offset);
+                encode_varint(buf, data.len() as u64);
+                buf.put_slice(data);
             }
             Frame::ConnectionClose { error_code, reason } => {
                 buf.put_u8(FrameType::ConnectionClose as u8);
@@ -55,6 +63,17 @@ impl Frame {
                 Ok(Frame::Padding { length })
             }
             0x01 => Ok(Frame::Ping),
+            0x06 => {
+                let offset = decode_varint(buf)?;
+                let length = decode_varint(buf)? as usize;
+                
+                if buf.remaining() < length {
+                    return Err(FrameError::InvalidFormat);
+                }
+                
+                let data = buf.copy_to_bytes(length);
+                Ok(Frame::Crypto { offset, data })
+            }
             0x1c => {
                 let error_code = decode_varint(buf)?;
                 let _frame_type = decode_varint(buf)?;
@@ -241,6 +260,7 @@ mod tests {
     fn test_frame_types() {
         assert_eq!(FrameType::Padding as u8, 0x00);
         assert_eq!(FrameType::Ping as u8, 0x01);
+        assert_eq!(FrameType::Crypto as u8, 0x06);
         assert_eq!(FrameType::ConnectionClose as u8, 0x1c);
     }
 
@@ -321,6 +341,75 @@ mod tests {
                 assert_eq!(reason, "Max error code");
             }
             _ => panic!("Expected ConnectionClose frame"),
+        }
+    }
+
+    #[test]
+    fn test_crypto_frame_encode_decode() {
+        let crypto_data = Bytes::from_static(b"Hello, TLS handshake data!");
+        let frame = Frame::Crypto {
+            offset: 42,
+            data: crypto_data.clone(),
+        };
+        
+        let mut buf = BytesMut::new();
+        frame.encode(&mut buf).unwrap();
+        
+        let mut bytes = buf.freeze();
+        let decoded = Frame::decode(&mut bytes).unwrap();
+        
+        match decoded {
+            Frame::Crypto { offset, data } => {
+                assert_eq!(offset, 42);
+                assert_eq!(data, crypto_data);
+            }
+            _ => panic!("Expected Crypto frame"),
+        }
+    }
+
+    #[test]
+    fn test_crypto_frame_empty_data() {
+        let frame = Frame::Crypto {
+            offset: 0,
+            data: Bytes::new(),
+        };
+        
+        let mut buf = BytesMut::new();
+        frame.encode(&mut buf).unwrap();
+        
+        let mut bytes = buf.freeze();
+        let decoded = Frame::decode(&mut bytes).unwrap();
+        
+        match decoded {
+            Frame::Crypto { offset, data } => {
+                assert_eq!(offset, 0);
+                assert_eq!(data.len(), 0);
+            }
+            _ => panic!("Expected Crypto frame"),
+        }
+    }
+
+    #[test]
+    fn test_crypto_frame_large_offset() {
+        let crypto_data = Bytes::from_static(b"TLS data");
+        let large_offset = 0x3FFFFFFFFFFFFFFF; // Max varint value
+        let frame = Frame::Crypto {
+            offset: large_offset,
+            data: crypto_data.clone(),
+        };
+        
+        let mut buf = BytesMut::new();
+        frame.encode(&mut buf).unwrap();
+        
+        let mut bytes = buf.freeze();
+        let decoded = Frame::decode(&mut bytes).unwrap();
+        
+        match decoded {
+            Frame::Crypto { offset, data } => {
+                assert_eq!(offset, large_offset);
+                assert_eq!(data, crypto_data);
+            }
+            _ => panic!("Expected Crypto frame"),
         }
     }
 }
