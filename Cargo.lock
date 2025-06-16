@@ -223,7 +223,7 @@ dependencies = [
  "bytes",
  "rand",
  "rcgen",
- "ring 0.16.20",
+ "ring 0.17.14",
  "rustls",
  "rustls-pemfile",
  "tokio",
