@@ -1,0 +1,13 @@
+[package]
+name = "oreno-quic"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "oreno_quic"
+path = "src/lib.rs"
+
+[dependencies]
+rand = "0.8"
+tokio = { version = "1.0", features = ["full"] }
+bytes = "1.0"
