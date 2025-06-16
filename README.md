@@ -24,13 +24,29 @@ cargo build
 
 ## Running
 
-Start the server:
+### Server and Client Communication
+
+Start the example server:
+
+```bash
+cargo run --example server
+```
+
+In another terminal, run the local client:
+
+```bash
+cargo run --example local_client
+```
+
+### Main Server Application
+
+Alternatively, start the main server application:
 
 ```bash
 cargo run
 ```
 
-In another terminal, run the example client:
+Then run the client example:
 
 ```bash
 cargo run --example client
@@ -67,7 +83,9 @@ src/
 └── connection.rs    # Connection state and management
 
 examples/
-└── client.rs        # Example client
+├── server.rs        # Example server with detailed logging
+├── client.rs        # Example client (connects to localhost)
+└── local_client.rs  # Local client for testing with example server
 
 tests/
 └── integration_test.rs  # Network communication tests
