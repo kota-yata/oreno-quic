@@ -32,6 +32,14 @@ impl QuicCrypto {
         }
     }
     
+    pub fn has_keys(&self, level: &EncryptionLevel) -> bool {
+        self.keys.contains_key(level)
+    }
+    
+    pub fn keys_count(&self) -> usize {
+        self.keys.len()
+    }
+    
     pub fn setup_initial_keys(&mut self, connection_id: &[u8], is_client: bool) -> Result<(), CryptoError> {
         // Simplified key setup for now - in a real implementation this would use proper QUIC key derivation
         let dummy_key_material = vec![0u8; 16];
